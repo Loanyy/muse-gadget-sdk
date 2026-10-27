@@ -26,6 +26,8 @@ static const char *TAG = "muse_pmu";
 #define REG_STATUS1 0x00        /* bit5 VBUS good, bit3 battery present */
 #define REG_STATUS2 0x01        /* bits[6:5] 01 = charging */
 #define REG_COMMON_CFG 0x10     /* bit0 = soft power-off */
+#define REG_PWROFF_STATUS 0x21  /* what powered it off last */
+#define REG_PWROFF_EN 0x22      /* bit1 = power off when PWR is held past the hold-off */
 #define REG_IRQ_LEVEL 0x27      /* bits[3:2] power-key hold-to-off time */
 #define REG_ADC_ENABLE 0x30     /* bit0 = battery voltage */
 #define REG_VBAT_H 0x34         /* bits[4:0]; 1 mV per count with REG_VBAT_L */
@@ -46,9 +48,12 @@ static const char *TAG = "muse_pmu";
 #define PKEY_SHORT (1u << 3)
 #define PKEY_ALL (PKEY_POS_EDGE | PKEY_NEG_EDGE | PKEY_LONG | PKEY_SHORT)
 
-/* bits[3:2] = 11 -> 10 s: longer than the 8 s talk limit, and a hardware
- * fallback if the firmware is wedged. */
+/* bits[3:2] = 11 -> 10 s, the longest: a hardware fallback if the firmware is
+ * wedged. A talk can run longer (MAX_SECS, muse_voice.c), so boards that talk
+ * on PWR keep the hold from powering off while PWR is down
+ * (muse_pmu_set_key_shutdown). */
 #define PKEY_OFF_10S (3u << 2)
+#define PWROFF_KEY (1u << 1)
 
 static i2c_master_dev_handle_t s_dev;
 
@@ -75,6 +80,9 @@ esp_err_t muse_pmu_init(i2c_master_bus_handle_t bus, bool key_irqs)
     uint8_t v;
     ESP_RETURN_ON_ERROR(rd(REG_IRQ_LEVEL, &v), TAG, "AXP2101 not responding");
     ESP_RETURN_ON_ERROR(wr(REG_IRQ_LEVEL, (v & ~0x0C) | PKEY_OFF_10S), TAG, "set off time");
+    /* The PMU keeps this through an ESP32 reset, so a talk the reset cut short
+     * could have left it off. */
+    ESP_RETURN_ON_ERROR(muse_pmu_set_key_shutdown(true), TAG, "key shutdown on");
 
     if (key_irqs) {
         ESP_RETURN_ON_ERROR(rd(REG_INTEN2, &v), TAG, "read inten2");
@@ -97,7 +105,10 @@ esp_err_t muse_pmu_init(i2c_master_bus_handle_t bus, bool key_irqs)
     ESP_RETURN_ON_ERROR(rd(REG_ADC_ENABLE, &v), TAG, "read adc enable");
     ESP_RETURN_ON_ERROR(wr(REG_ADC_ENABLE, v | 0x01), TAG, "enable battery voltage");
 
-    ESP_LOGI(TAG, "AXP2101 ready (hardware PWR hold-off 10 s)");
+    uint8_t en = 0, off = 0;
+    rd(REG_PWROFF_EN, &en);
+    rd(REG_PWROFF_STATUS, &off);
+    ESP_LOGI(TAG, "AXP2101 ready (hardware PWR hold-off 10 s, PWROFF_EN %02x, last off %02x)", en, off);
     return ESP_OK;
 }
 
@@ -117,6 +128,18 @@ esp_err_t muse_pmu_keep_rails(uint8_t dcdc, uint16_t ldo)
     ESP_RETURN_ON_ERROR(wr(REG_LDO_ONOFF1, ldo1_new), TAG, "ldo1 off");
     ESP_LOGI(TAG, "rails: DCDC %02x -> %02x, LDO %02x %02x -> %02x %02x", dc & 0x1F, dc_new & 0x1F, ldo0,
              ldo1 & 0x01, ldo0_new, ldo1_new & 0x01);
+    return ESP_OK;
+}
+
+esp_err_t muse_pmu_set_key_shutdown(bool on)
+{
+    uint8_t v;
+    if (!s_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    ESP_RETURN_ON_ERROR(rd(REG_PWROFF_EN, &v), TAG, "read pwroff_en");
+    ESP_RETURN_ON_ERROR(wr(REG_PWROFF_EN, on ? v | PWROFF_KEY : v & ~PWROFF_KEY), TAG, "key shutdown %s",
+                        on ? "on" : "off");
     return ESP_OK;
 }
 

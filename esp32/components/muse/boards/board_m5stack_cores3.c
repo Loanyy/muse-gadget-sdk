@@ -123,8 +123,13 @@ static unsigned poll_buttons(void)
         return 0;
     }
     unsigned key = muse_pmu_poll_key();
-    return (key & MUSE_PMU_KEY_PRESS ? MUSE_BTN_TALK_PRESS : 0) |
-           (key & MUSE_PMU_KEY_RELEASE ? MUSE_BTN_TALK_RELEASE : 0);
+    bool press = key & MUSE_PMU_KEY_PRESS, release = key & MUSE_PMU_KEY_RELEASE;
+    /* A talk can outlast the PMU's hold-off: held, PWR mustn't power off.
+     * Both edges in one read leave PWR as it was (talk_button's order). */
+    if (press != release) {
+        muse_pmu_set_key_shutdown(release);
+    }
+    return (press ? MUSE_BTN_TALK_PRESS : 0) | (release ? MUSE_BTN_TALK_RELEASE : 0);
 }
 
 static esp_err_t read_power(muse_power_t *out)

@@ -231,6 +231,9 @@ static unsigned poll_buttons(void)
                 pwr_held = true;
             if (pmu & MUSE_PMU_KEY_RELEASE)
                 pwr_held = false;
+            /* A talk can outlast the PMU's hold-off: held, PWR mustn't power off. */
+            if (pmu & (MUSE_PMU_KEY_PRESS | MUSE_PMU_KEY_RELEASE))
+                muse_pmu_set_key_shutdown(!pwr_held);
         }
     }
     bool held = key_held || pwr_held;

@@ -234,7 +234,15 @@ static unsigned poll_buttons(void)
 #else
 static unsigned poll_buttons(void)
 {
-    return muse_gpio_button_poll(&s_pwr) | muse_gpio_button_poll(&s_boot) << 2;   /* BOOT is aux */
+    unsigned pwr = muse_gpio_button_poll(&s_pwr);
+    /* A talk can outlast the PMU's hold-off: held, PWR mustn't power off. */
+    if (pwr & MUSE_BTN_TALK_PRESS) {
+        muse_pmu_set_key_shutdown(false);
+    }
+    if (pwr & MUSE_BTN_TALK_RELEASE) {
+        muse_pmu_set_key_shutdown(true);
+    }
+    return pwr | muse_gpio_button_poll(&s_boot) << 2;   /* BOOT is aux */
 }
 
 static void wait_buttons(int timeout_ms)
