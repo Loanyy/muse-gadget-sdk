@@ -1,0 +1,785 @@
+From c708a774252c44dfe042ede0ab99c7446d10abdf Mon Sep 17 00:00:00 2001
+From: Okan Ozcan <206270962+Loanyy@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 22:01:31 +0000
+Subject: [PATCH] esp32: don't let a talk on the AXP2101's power key outlast
+ its hold-off
+
+On the boards that talk on PWR (Waveshare 1.75C and 2.16, M5Stack
+CoreS3), holding talk for more than 10 s cut the board's power: the
+AXP2101 powers off when its key is held past OFFLEVEL, which init sets
+to 10 s, its longest, while a talk runs up to MAX_SECS (15 s). The
+comment there still said the talk limit was 8 s. A shorter talk cap
+wouldn't help, since the PMU counts the physical hold, not the
+recording.
+
+REG22[1] ("PWRON > OFFLEVEL as POWEROFF Source enable" in the AXP2101
+datasheet) gates that power-off. muse_pmu_set_key_shutdown() changes
+just that bit; those boards turn it off on PWR's press and back on at
+its release, from poll_buttons() in the input task, so a talk that
+MAX_SECS ends stays covered until PWR comes up. Init turns it on, since
+the PMU keeps it through an ESP32 reset, and logs it with REG21 (what
+last powered the PMU off). With PWR up, or the input task not polling,
+the 10 s hold still powers off. KEY3 on the 2.16, the 1.75 (BOOT
+talks) and the C6 boards (PWR is aux) are unchanged. A failed write is
+logged; the talk goes ahead.
+
+Fixes #277
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../muse/boards/board_m5stack_cores3.c        |   9 +-
+ .../muse/boards/board_waveshare_s3_175c.c     |  10 +-
+ .../muse/boards/board_waveshare_s3_216.c      |   3 +
+ esp32/components/muse/muse_pmu.c              |  29 +-
+ esp32/components/muse/muse_pmu.h              |   5 +
+ esp32/tests/muse_pmu_harness.c                | 158 ++++++++++
+ esp32/tests/pmu_fakes/driver/i2c_master.h     |  40 +++
+ esp32/tests/pmu_fakes/esp_check.h             |  36 +++
+ esp32/tests/pmu_fakes/esp_err.h               |  29 ++
+ esp32/tests/pmu_fakes/esp_log.h               |  24 ++
+ esp32/tests/test_muse_pmu.py                  | 271 ++++++++++++++++++
+ 11 files changed, 608 insertions(+), 6 deletions(-)
+ create mode 100644 esp32/tests/muse_pmu_harness.c
+ create mode 100644 esp32/tests/pmu_fakes/driver/i2c_master.h
+ create mode 100644 esp32/tests/pmu_fakes/esp_check.h
+ create mode 100644 esp32/tests/pmu_fakes/esp_err.h
+ create mode 100644 esp32/tests/pmu_fakes/esp_log.h
+ create mode 100644 esp32/tests/test_muse_pmu.py
+
+diff --git a/esp32/components/muse/boards/board_m5stack_cores3.c b/esp32/components/muse/boards/board_m5stack_cores3.c
+index 38bb113..1098d60 100644
+--- a/esp32/components/muse/boards/board_m5stack_cores3.c
++++ b/esp32/components/muse/boards/board_m5stack_cores3.c
+@@ -123,8 +123,13 @@ static unsigned poll_buttons(void)
+         return 0;
+     }
+     unsigned key = muse_pmu_poll_key();
+-    return (key & MUSE_PMU_KEY_PRESS ? MUSE_BTN_TALK_PRESS : 0) |
+-           (key & MUSE_PMU_KEY_RELEASE ? MUSE_BTN_TALK_RELEASE : 0);
++    bool press = key & MUSE_PMU_KEY_PRESS, release = key & MUSE_PMU_KEY_RELEASE;
++    /* A talk can outlast the PMU's hold-off: held, PWR mustn't power off.
++     * Both edges in one read leave PWR as it was (talk_button's order). */
++    if (press != release) {
++        muse_pmu_set_key_shutdown(release);
++    }
++    return (press ? MUSE_BTN_TALK_PRESS : 0) | (release ? MUSE_BTN_TALK_RELEASE : 0);
+ }
+ 
+ static esp_err_t read_power(muse_power_t *out)
+diff --git a/esp32/components/muse/boards/board_waveshare_s3_175c.c b/esp32/components/muse/boards/board_waveshare_s3_175c.c
+index 55214e5..9de6746 100644
+--- a/esp32/components/muse/boards/board_waveshare_s3_175c.c
++++ b/esp32/components/muse/boards/board_waveshare_s3_175c.c
+@@ -234,7 +234,15 @@ static unsigned poll_buttons(void)
+ #else
+ static unsigned poll_buttons(void)
+ {
+-    return muse_gpio_button_poll(&s_pwr) | muse_gpio_button_poll(&s_boot) << 2;   /* BOOT is aux */
++    unsigned pwr = muse_gpio_button_poll(&s_pwr);
++    /* A talk can outlast the PMU's hold-off: held, PWR mustn't power off. */
++    if (pwr & MUSE_BTN_TALK_PRESS) {
++        muse_pmu_set_key_shutdown(false);
++    }
++    if (pwr & MUSE_BTN_TALK_RELEASE) {
++        muse_pmu_set_key_shutdown(true);
++    }
++    return pwr | muse_gpio_button_poll(&s_boot) << 2;   /* BOOT is aux */
+ }
+ 
+ static void wait_buttons(int timeout_ms)
+diff --git a/esp32/components/muse/boards/board_waveshare_s3_216.c b/esp32/components/muse/boards/board_waveshare_s3_216.c
+index 5252d0e..cc19e63 100644
+--- a/esp32/components/muse/boards/board_waveshare_s3_216.c
++++ b/esp32/components/muse/boards/board_waveshare_s3_216.c
+@@ -231,6 +231,9 @@ static unsigned poll_buttons(void)
+                 pwr_held = true;
+             if (pmu & MUSE_PMU_KEY_RELEASE)
+                 pwr_held = false;
++            /* A talk can outlast the PMU's hold-off: held, PWR mustn't power off. */
++            if (pmu & (MUSE_PMU_KEY_PRESS | MUSE_PMU_KEY_RELEASE))
++                muse_pmu_set_key_shutdown(!pwr_held);
+         }
+     }
+     bool held = key_held || pwr_held;
+diff --git a/esp32/components/muse/muse_pmu.c b/esp32/components/muse/muse_pmu.c
+index aca01a4..9a20e14 100644
+--- a/esp32/components/muse/muse_pmu.c
++++ b/esp32/components/muse/muse_pmu.c
+@@ -26,6 +26,8 @@ static const char *TAG = "muse_pmu";
+ #define REG_STATUS1 0x00        /* bit5 VBUS good, bit3 battery present */
+ #define REG_STATUS2 0x01        /* bits[6:5] 01 = charging */
+ #define REG_COMMON_CFG 0x10     /* bit0 = soft power-off */
++#define REG_PWROFF_STATUS 0x21  /* what powered it off last */
++#define REG_PWROFF_EN 0x22      /* bit1 = power off when PWR is held past the hold-off */
+ #define REG_IRQ_LEVEL 0x27      /* bits[3:2] power-key hold-to-off time */
+ #define REG_ADC_ENABLE 0x30     /* bit0 = battery voltage */
+ #define REG_VBAT_H 0x34         /* bits[4:0]; 1 mV per count with REG_VBAT_L */
+@@ -46,9 +48,12 @@ static const char *TAG = "muse_pmu";
+ #define PKEY_SHORT (1u << 3)
+ #define PKEY_ALL (PKEY_POS_EDGE | PKEY_NEG_EDGE | PKEY_LONG | PKEY_SHORT)
+ 
+-/* bits[3:2] = 11 -> 10 s: longer than the 8 s talk limit, and a hardware
+- * fallback if the firmware is wedged. */
++/* bits[3:2] = 11 -> 10 s, the longest: a hardware fallback if the firmware is
++ * wedged. A talk can run longer (MAX_SECS, muse_voice.c), so boards that talk
++ * on PWR keep the hold from powering off while PWR is down
++ * (muse_pmu_set_key_shutdown). */
+ #define PKEY_OFF_10S (3u << 2)
++#define PWROFF_KEY (1u << 1)
+ 
+ static i2c_master_dev_handle_t s_dev;
+ 
+@@ -75,6 +80,9 @@ esp_err_t muse_pmu_init(i2c_master_bus_handle_t bus, bool key_irqs)
+     uint8_t v;
+     ESP_RETURN_ON_ERROR(rd(REG_IRQ_LEVEL, &v), TAG, "AXP2101 not responding");
+     ESP_RETURN_ON_ERROR(wr(REG_IRQ_LEVEL, (v & ~0x0C) | PKEY_OFF_10S), TAG, "set off time");
++    /* The PMU keeps this through an ESP32 reset, so a talk the reset cut short
++     * could have left it off. */
++    ESP_RETURN_ON_ERROR(muse_pmu_set_key_shutdown(true), TAG, "key shutdown on");
+ 
+     if (key_irqs) {
+         ESP_RETURN_ON_ERROR(rd(REG_INTEN2, &v), TAG, "read inten2");
+@@ -97,7 +105,10 @@ esp_err_t muse_pmu_init(i2c_master_bus_handle_t bus, bool key_irqs)
+     ESP_RETURN_ON_ERROR(rd(REG_ADC_ENABLE, &v), TAG, "read adc enable");
+     ESP_RETURN_ON_ERROR(wr(REG_ADC_ENABLE, v | 0x01), TAG, "enable battery voltage");
+ 
+-    ESP_LOGI(TAG, "AXP2101 ready (hardware PWR hold-off 10 s)");
++    uint8_t en = 0, off = 0;
++    rd(REG_PWROFF_EN, &en);
++    rd(REG_PWROFF_STATUS, &off);
++    ESP_LOGI(TAG, "AXP2101 ready (hardware PWR hold-off 10 s, PWROFF_EN %02x, last off %02x)", en, off);
+     return ESP_OK;
+ }
+ 
+@@ -120,6 +131,18 @@ esp_err_t muse_pmu_keep_rails(uint8_t dcdc, uint16_t ldo)
+     return ESP_OK;
+ }
+ 
++esp_err_t muse_pmu_set_key_shutdown(bool on)
++{
++    uint8_t v;
++    if (!s_dev) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    ESP_RETURN_ON_ERROR(rd(REG_PWROFF_EN, &v), TAG, "read pwroff_en");
++    ESP_RETURN_ON_ERROR(wr(REG_PWROFF_EN, on ? v | PWROFF_KEY : v & ~PWROFF_KEY), TAG, "key shutdown %s",
++                        on ? "on" : "off");
++    return ESP_OK;
++}
++
+ unsigned muse_pmu_poll_key(void)
+ {
+     uint8_t sts;
+diff --git a/esp32/components/muse/muse_pmu.h b/esp32/components/muse/muse_pmu.h
+index d87eecc..6793adb 100644
+--- a/esp32/components/muse/muse_pmu.h
++++ b/esp32/components/muse/muse_pmu.h
+@@ -43,6 +43,11 @@ esp_err_t muse_pmu_init(i2c_master_bus_handle_t bus, bool key_irqs);
+  * in bit 8. Turns nothing on. */
+ esp_err_t muse_pmu_keep_rails(uint8_t dcdc, uint16_t ldo);
+ 
++/* Whether holding PWR past the 10 s hold-off powers the board off. On after
++ * muse_pmu_init(); boards that talk on PWR turn it off while PWR is held,
++ * since a talk can outlast it. ESP_ERR_INVALID_STATE without a PMU. */
++esp_err_t muse_pmu_set_key_shutdown(bool on);
++
+ /* Returns and clears latched MUSE_PMU_KEY_* events. */
+ unsigned muse_pmu_poll_key(void);
+ 
+diff --git a/esp32/tests/muse_pmu_harness.c b/esp32/tests/muse_pmu_harness.c
+new file mode 100644
+index 0000000..48fb6ad
+--- /dev/null
++++ b/esp32/tests/muse_pmu_harness.c
+@@ -0,0 +1,158 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* The AXP2101 driver (muse_pmu.c) against a fake register file on a fake I2C
++ * bus, for test_muse_pmu.py: one case per run, by its number. */
++#include <assert.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "muse_pmu.c"
++
++#define PWROFF_EN 0x22
++#define IRQ_LEVEL 0x27
++
++struct fake_i2c_bus { int unused; };
++struct fake_i2c_dev { uint16_t addr; };
++
++static struct fake_i2c_bus s_bus;
++static struct fake_i2c_dev s_axp;
++static uint8_t s_regs[256];
++static int s_writes[256];      /* writes per register */
++static int s_reads;
++static int s_fail_read = -1, s_fail_write = -1;
++static esp_err_t s_add_err;
++
++esp_err_t i2c_master_bus_add_device(i2c_master_bus_handle_t bus, const i2c_device_config_t *cfg,
++                                    i2c_master_dev_handle_t *dev)
++{
++    assert(bus == &s_bus && cfg->device_address == 0x34);
++    if (s_add_err) {
++        return s_add_err;
++    }
++    s_axp.addr = cfg->device_address;
++    *dev = &s_axp;
++    return ESP_OK;
++}
++
++esp_err_t i2c_master_transmit(i2c_master_dev_handle_t dev, const uint8_t *buf, size_t len, int timeout_ms)
++{
++    assert(dev == &s_axp && len == 2 && timeout_ms > 0);
++    if (buf[0] == s_fail_write) {
++        return ESP_ERR_TIMEOUT;
++    }
++    s_regs[buf[0]] = buf[1];
++    s_writes[buf[0]]++;
++    return ESP_OK;
++}
++
++esp_err_t i2c_master_transmit_receive(i2c_master_dev_handle_t dev, const uint8_t *wbuf, size_t wlen, uint8_t *rbuf,
++                                      size_t rlen, int timeout_ms)
++{
++    assert(dev == &s_axp && wlen == 1 && rlen == 1 && timeout_ms > 0);
++    s_reads++;
++    if (wbuf[0] == s_fail_read) {
++        return ESP_ERR_TIMEOUT;
++    }
++    *rbuf = s_regs[wbuf[0]];
++    return ESP_OK;
++}
++
++static int total_writes(void)
++{
++    int n = 0;
++    for (int i = 0; i < 256; i++) {
++        n += s_writes[i];
++    }
++    return n;
++}
++
++/* Init: 10 s hold-off in REG27[3:2], and REG22[1] (power off past it) on,
++ * whatever a reset left there; every other bit of both kept. */
++static void init_turns_key_shutdown_on(void)
++{
++    s_regs[IRQ_LEVEL] = 0x31;   /* IRQLEVEL 2.5 s, OFFLEVEL 4 s, ONLEVEL 512 ms */
++    s_regs[PWROFF_EN] = 0x05;   /* over-temperature on, restart; key shutdown off */
++    assert(muse_pmu_init(&s_bus, true) == ESP_OK);
++    assert(s_regs[IRQ_LEVEL] == 0x3D);
++    assert(s_regs[PWROFF_EN] == 0x07);
++
++    s_regs[PWROFF_EN] = 0x02;   /* already on: still on, nothing else set */
++    assert(muse_pmu_init(&s_bus, false) == ESP_OK);
++    assert(s_regs[PWROFF_EN] == 0x02);
++}
++
++/* The setter changes REG22[1] and nothing else. */
++static void setter_changes_only_bit1(void)
++{
++    assert(muse_pmu_init(&s_bus, true) == ESP_OK);
++    for (int start = 0; start < 8; start++) {
++        memset(s_writes, 0, sizeof(s_writes));
++        s_regs[PWROFF_EN] = (uint8_t)start;
++        assert(muse_pmu_set_key_shutdown(false) == ESP_OK);
++        assert(s_regs[PWROFF_EN] == (start & ~0x02));
++        assert(muse_pmu_set_key_shutdown(true) == ESP_OK);
++        assert(s_regs[PWROFF_EN] == (start | 0x02));
++        assert(s_writes[PWROFF_EN] == 2 && total_writes() == 2);
++    }
++}
++
++/* A failed read writes nothing; a failed read or write is returned. */
++static void errors_are_returned(void)
++{
++    assert(muse_pmu_init(&s_bus, true) == ESP_OK);
++    s_regs[PWROFF_EN] = 0x07;
++    memset(s_writes, 0, sizeof(s_writes));
++    s_fail_read = PWROFF_EN;
++    assert(muse_pmu_set_key_shutdown(false) == ESP_ERR_TIMEOUT);
++    assert(total_writes() == 0 && s_regs[PWROFF_EN] == 0x07);
++    s_fail_read = -1;
++    s_fail_write = PWROFF_EN;
++    assert(muse_pmu_set_key_shutdown(false) == ESP_ERR_TIMEOUT);
++    assert(s_regs[PWROFF_EN] == 0x07);
++    /* Nor can init leave the key shutdown unknown and report success. */
++    assert(muse_pmu_init(&s_bus, true) == ESP_ERR_TIMEOUT);
++    s_fail_write = -1;
++    s_fail_read = PWROFF_EN;
++    assert(muse_pmu_init(&s_bus, true) == ESP_ERR_TIMEOUT);
++}
++
++/* Without a PMU, nothing goes on the bus. */
++static void no_pmu(void)
++{
++    assert(muse_pmu_set_key_shutdown(false) == ESP_ERR_INVALID_STATE);
++    assert(muse_pmu_set_key_shutdown(true) == ESP_ERR_INVALID_STATE);
++    assert(s_reads == 0 && total_writes() == 0);
++    s_add_err = ESP_FAIL;
++    assert(muse_pmu_init(&s_bus, true) == ESP_FAIL);
++    assert(muse_pmu_set_key_shutdown(true) == ESP_ERR_INVALID_STATE);
++    assert(s_reads == 0 && total_writes() == 0);
++}
++
++int main(int argc, char **argv)
++{
++    assert(argc == 2);
++    switch (atoi(argv[1])) {
++    case 0: init_turns_key_shutdown_on(); break;
++    case 1: setter_changes_only_bit1(); break;
++    case 2: errors_are_returned(); break;
++    case 3: no_pmu(); break;
++    default: return 2;
++    }
++    return 0;
++}
+diff --git a/esp32/tests/pmu_fakes/driver/i2c_master.h b/esp32/tests/pmu_fakes/driver/i2c_master.h
+new file mode 100644
+index 0000000..f71427c
+--- /dev/null
++++ b/esp32/tests/pmu_fakes/driver/i2c_master.h
+@@ -0,0 +1,40 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include "esp_err.h"
++
++/* Just what muse_pmu.c uses; muse_pmu_harness.c fakes the AXP2101 behind it. */
++typedef struct fake_i2c_bus *i2c_master_bus_handle_t;
++typedef struct fake_i2c_dev *i2c_master_dev_handle_t;
++
++typedef enum { I2C_ADDR_BIT_LEN_7 } i2c_addr_bit_len_t;
++
++typedef struct {
++    i2c_addr_bit_len_t dev_addr_length;
++    uint16_t device_address;
++    uint32_t scl_speed_hz;
++} i2c_device_config_t;
++
++esp_err_t i2c_master_bus_add_device(i2c_master_bus_handle_t bus, const i2c_device_config_t *cfg,
++                                    i2c_master_dev_handle_t *dev);
++esp_err_t i2c_master_transmit(i2c_master_dev_handle_t dev, const uint8_t *buf, size_t len, int timeout_ms);
++esp_err_t i2c_master_transmit_receive(i2c_master_dev_handle_t dev, const uint8_t *wbuf, size_t wlen, uint8_t *rbuf,
++                                      size_t rlen, int timeout_ms);
+diff --git a/esp32/tests/pmu_fakes/esp_check.h b/esp32/tests/pmu_fakes/esp_check.h
+new file mode 100644
+index 0000000..bd96df5
+--- /dev/null
++++ b/esp32/tests/pmu_fakes/esp_check.h
+@@ -0,0 +1,36 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include "esp_err.h"
++#include "esp_log.h"
++
++/* As IDF's: log and return the error, or return err_code if a is false. */
++#define ESP_RETURN_ON_ERROR(x, log_tag, format, ...) do {        \
++        esp_err_t err_rc_ = (x);                                 \
++        if (err_rc_ != ESP_OK) {                                 \
++            ESP_LOGE(log_tag, format, ##__VA_ARGS__);            \
++            return err_rc_;                                      \
++        }                                                        \
++    } while (0)
++
++#define ESP_RETURN_ON_FALSE(a, err_code, log_tag, format, ...) do { \
++        if (!(a)) {                                                 \
++            ESP_LOGE(log_tag, format, ##__VA_ARGS__);               \
++            return err_code;                                        \
++        }                                                           \
++    } while (0)
+diff --git a/esp32/tests/pmu_fakes/esp_err.h b/esp32/tests/pmu_fakes/esp_err.h
+new file mode 100644
+index 0000000..fbfd952
+--- /dev/null
++++ b/esp32/tests/pmu_fakes/esp_err.h
+@@ -0,0 +1,29 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++typedef int esp_err_t;
++#define ESP_OK 0
++#define ESP_FAIL -1
++#define ESP_ERR_INVALID_STATE 0x103
++#define ESP_ERR_TIMEOUT 0x107
++
++static inline const char *esp_err_to_name(esp_err_t err)
++{
++    (void)err;
++    return "error";
++}
+diff --git a/esp32/tests/pmu_fakes/esp_log.h b/esp32/tests/pmu_fakes/esp_log.h
+new file mode 100644
+index 0000000..8daa677
+--- /dev/null
++++ b/esp32/tests/pmu_fakes/esp_log.h
+@@ -0,0 +1,24 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <stdio.h>
++
++// To stderr, so the formats get checked against their arguments.
++#define ESP_LOGE(tag, fmt, ...) fprintf(stderr, "%s: " fmt "\n", tag, ##__VA_ARGS__)
++#define ESP_LOGW(tag, fmt, ...) fprintf(stderr, "%s: " fmt "\n", tag, ##__VA_ARGS__)
++#define ESP_LOGI(tag, fmt, ...) fprintf(stderr, "%s: " fmt "\n", tag, ##__VA_ARGS__)
+diff --git a/esp32/tests/test_muse_pmu.py b/esp32/tests/test_muse_pmu.py
+new file mode 100644
+index 0000000..94b15de
+--- /dev/null
++++ b/esp32/tests/test_muse_pmu.py
+@@ -0,0 +1,271 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""The AXP2101 power key: muse_pmu.c against a fake register file, and the
++boards that talk on PWR, whose talk can outlast the PMU's 10 s hold-off."""
++import os
++from pathlib import Path
++import re
++import shlex
++import subprocess
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++MUSE = ROOT / "components/muse"
++TESTS = ROOT / "tests"
++
++
++def cc():
++    return shlex.split(os.environ.get("CC", "cc"))
++
++
++def functions(source, name):
++    """Every definition of a static function, in order (a board can have one
++    per #if branch)."""
++    found = []
++    for match in re.finditer(r"^static (?:unsigned|int|void) " + name + r"\([^)]*\)\n\{", source, re.M):
++        depth, end = 1, source.index("{", match.start()) + 1
++        while depth:
++            depth += (source[end] == "{") - (source[end] == "}")
++            end += 1
++        found.append(source[match.start():end])
++    return found
++
++
++def defines(source, pattern):
++    return "\n".join(re.findall(r"^#define (?:" + pattern + r")\b.*", source, re.M))
++
++
++class MusePmu(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tmp = tempfile.TemporaryDirectory()
++        cls.binary = Path(cls.tmp.name) / "muse_pmu"
++        built = subprocess.run([*cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-I", str(TESTS / "pmu_fakes"),
++                                "-I", str(MUSE), str(TESTS / "muse_pmu_harness.c"), "-o", str(cls.binary)],
++                               capture_output=True, text=True)
++        if built.returncode:
++            raise AssertionError(built.stderr)
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.tmp.cleanup()
++
++    def run_case(self, case):
++        result = subprocess.run([str(self.binary), str(case)], capture_output=True, text=True)
++        self.assertEqual(result.returncode, 0, result.stderr)
++
++    def test_init_sets_10s_hold_off_and_turns_key_shutdown_on(self):
++        self.run_case(0)
++
++    def test_key_shutdown_changes_only_its_bit(self):
++        self.run_case(1)
++
++    def test_i2c_errors_are_returned(self):
++        self.run_case(2)
++
++    def test_no_pmu_is_invalid_state_and_quiet(self):
++        self.run_case(3)
++
++
++# Fakes for the boards' poll_buttons(): GPIO buttons and the PMU's latched key
++# edges, one queued per poll, and every muse_pmu_set_key_shutdown() call.
++FAKES = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#define ESP_OK 0
++#define ESP_FAIL -1
++typedef int esp_err_t;
++#define FAKE static __attribute__((unused))   /* not every board calls every fake */
++typedef struct { unsigned next; } muse_gpio_button_t;
++FAKE unsigned muse_gpio_button_poll(muse_gpio_button_t *b) { unsigned e = b->next; b->next = 0; return e; }
++static unsigned s_pmu_key;
++FAKE unsigned muse_pmu_poll_key(void) { unsigned e = s_pmu_key; s_pmu_key = 0; return e; }
++static int calls;
++static bool shutdown_on = true;
++static esp_err_t set_err;
++FAKE esp_err_t muse_pmu_set_key_shutdown(bool on) {
++    ++calls;
++    if (set_err) return set_err;
++    shutdown_on = on;
++    return ESP_OK;
++}
++'''
++
++
++class PowerKeyTalkBoards(unittest.TestCase):
++    """Held, a PWR that talks keeps the PMU from powering off; released, the
++    hold-to-off works again. Other keys, and boards that don't talk on PWR,
++    leave it alone."""
++
++    @classmethod
++    def setUpClass(cls):
++        cls.tmp = tempfile.TemporaryDirectory()
++        header = (MUSE / "muse_board.h").read_text()
++        pmu = (MUSE / "muse_pmu.h").read_text()
++        cls.flags = defines(header, r"MUSE_BTN_\w+") + "\n" + defines(pmu, r"MUSE_PMU_KEY_\w+") + "\n"
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.tmp.cleanup()
++
++    def build_and_run(self, name, code):
++        path = Path(self.tmp.name) / (name + ".c")
++        path.write_text(FAKES + self.flags + code)
++        built = subprocess.run([*cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror", str(path),
++                                "-o", str(path.with_suffix(""))], capture_output=True, text=True)
++        self.assertEqual(built.returncode, 0, built.stderr)
++        result = subprocess.run([str(path.with_suffix(""))], capture_output=True, text=True)
++        self.assertEqual(result.returncode, 0, result.stderr)
++
++    def board(self, name):
++        return (MUSE / "boards" / name).read_text()
++
++    def test_waveshare_175c_pwr(self):
++        source = self.board("board_waveshare_s3_175c.c")
++        polls = functions(source, "poll_buttons")
++        pwr = next(f for f in polls if "s_pwr" in f)
++        self.build_and_run("s3_175c", r'''
++static muse_gpio_button_t s_pwr, s_boot;
++''' + pwr + r'''
++int main(void) {
++    s_pwr.next = MUSE_BTN_TALK_PRESS;
++    assert(poll_buttons() == MUSE_BTN_TALK_PRESS);
++    assert(calls == 1 && !shutdown_on);
++    for (int i = 0; i < 1500; i++) assert(poll_buttons() == 0);   /* held 15 s, past MAX_SECS */
++    assert(calls == 1 && !shutdown_on);
++    s_pwr.next = MUSE_BTN_TALK_RELEASE;
++    assert(poll_buttons() == MUSE_BTN_TALK_RELEASE);
++    assert(calls == 2 && shutdown_on);
++    s_boot.next = MUSE_BTN_TALK_PRESS;   /* BOOT is aux */
++    assert(poll_buttons() == MUSE_BTN_AUX_PRESS);
++    s_boot.next = MUSE_BTN_TALK_RELEASE;
++    assert(poll_buttons() == MUSE_BTN_AUX_RELEASE && calls == 2);
++    /* Held through boot, PWR's first edge is a release: on, as it was. */
++    s_pwr.next = MUSE_BTN_TALK_RELEASE;
++    assert(poll_buttons() == MUSE_BTN_TALK_RELEASE && calls == 3 && shutdown_on);
++    /* The PMU not answering doesn't stop the talk. */
++    set_err = ESP_FAIL;
++    s_pwr.next = MUSE_BTN_TALK_PRESS;
++    assert(poll_buttons() == MUSE_BTN_TALK_PRESS && calls == 4);
++    return 0;
++}
++''')
++
++    def test_waveshare_175_boot_talks_and_pwr_is_left_to_the_pmu(self):
++        source = self.board("board_waveshare_s3_175c.c")
++        polls = functions(source, "poll_buttons")
++        pmu = next(f for f in polls if "muse_pmu_poll_key" in f)
++        self.build_and_run("s3_175", defines(source, r"PMU_KEY_EVERY") + r'''
++static muse_gpio_button_t s_boot;
++''' + pmu + r'''
++int main(void) {
++    s_boot.next = MUSE_BTN_TALK_PRESS;
++    assert(poll_buttons() == MUSE_BTN_TALK_PRESS);
++    s_pmu_key = MUSE_PMU_KEY_PRESS;   /* PWR is aux; a long hold still powers off */
++    unsigned ev = 0;
++    for (int i = 0; i < 4; i++) ev |= poll_buttons();
++    assert(ev == MUSE_BTN_AUX_PRESS);
++    s_pmu_key = MUSE_PMU_KEY_RELEASE;
++    ev = 0;
++    for (int i = 0; i < 4; i++) ev |= poll_buttons();
++    assert(ev == MUSE_BTN_AUX_RELEASE);
++    assert(calls == 0);
++    return 0;
++}
++''')
++
++    def test_m5stack_cores3_pwr(self):
++        source = self.board("board_m5stack_cores3.c")
++        (poll,) = functions(source, "poll_buttons")
++        self.build_and_run("cores3", defines(source, r"PMU_KEY_EVERY") + r'''
++static bool s_pmu = true;
++''' + poll + r'''
++/* The PMU is read every PMU_KEY_EVERY polls. */
++static unsigned poll_pmu(unsigned key) {
++    s_pmu_key = key;
++    unsigned ev = 0;
++    for (int i = 0; i < PMU_KEY_EVERY; i++) ev |= poll_buttons();
++    assert(s_pmu_key == 0);
++    return ev;
++}
++int main(void) {
++    assert(poll_pmu(MUSE_PMU_KEY_PRESS) == MUSE_BTN_TALK_PRESS);
++    assert(calls == 1 && !shutdown_on);
++    for (int i = 0; i < 750; i++) assert(poll_pmu(0) == 0);   /* held 15 s */
++    assert(calls == 1);
++    assert(poll_pmu(MUSE_PMU_KEY_RELEASE | MUSE_PMU_KEY_LONG) == MUSE_BTN_TALK_RELEASE);
++    assert(calls == 2 && shutdown_on);
++    /* A tap inside one read: press then release, so still released. */
++    assert(poll_pmu(MUSE_PMU_KEY_PRESS | MUSE_PMU_KEY_RELEASE | MUSE_PMU_KEY_CLICK) ==
++           (MUSE_BTN_TALK_PRESS | MUSE_BTN_TALK_RELEASE));
++    assert(calls == 2 && shutdown_on);
++    /* Held, then release and a new press inside one read: still held. */
++    poll_pmu(MUSE_PMU_KEY_PRESS);
++    assert(calls == 3 && !shutdown_on);
++    poll_pmu(MUSE_PMU_KEY_RELEASE | MUSE_PMU_KEY_PRESS);
++    assert(calls == 3 && !shutdown_on);
++    poll_pmu(MUSE_PMU_KEY_RELEASE);
++    assert(calls == 4 && shutdown_on);
++    /* The PMU not answering doesn't stop the talk. */
++    set_err = ESP_FAIL;
++    assert(poll_pmu(MUSE_PMU_KEY_PRESS) == MUSE_BTN_TALK_PRESS && calls == 5);
++    return 0;
++}
++''')
++
++    def test_waveshare_216_pwr_but_not_key3(self):
++        source = self.board("board_waveshare_s3_216.c")
++        (poll,) = functions(source, "poll_buttons")
++        self.build_and_run("s3_216", defines(source, r"PMU_KEY_EVERY") + r'''
++static muse_gpio_button_t s_key, s_boot;
++''' + poll + r'''
++static unsigned poll_pmu(unsigned key) {
++    s_pmu_key = key;
++    unsigned ev = 0;
++    for (int i = 0; i < PMU_KEY_EVERY; i++) ev |= poll_buttons();
++    assert(s_pmu_key == 0);
++    return ev;
++}
++int main(void) {
++    /* KEY3 talks without the PMU. */
++    s_key.next = MUSE_BTN_TALK_PRESS;
++    assert(poll_pmu(0) == MUSE_BTN_TALK_PRESS);
++    s_key.next = MUSE_BTN_TALK_RELEASE;
++    assert(poll_pmu(0) == MUSE_BTN_TALK_RELEASE);
++    assert(calls == 0);
++    /* PWR does. */
++    assert(poll_pmu(MUSE_PMU_KEY_PRESS) == MUSE_BTN_TALK_PRESS);
++    assert(calls == 1 && !shutdown_on);
++    for (int i = 0; i < 750; i++) assert(poll_pmu(0) == 0);
++    assert(poll_pmu(MUSE_PMU_KEY_RELEASE) == MUSE_BTN_TALK_RELEASE);
++    assert(calls == 2 && shutdown_on);
++    /* A whole press inside one read is dropped, and so leaves it on. */
++    assert(poll_pmu(MUSE_PMU_KEY_PRESS | MUSE_PMU_KEY_RELEASE) == 0);
++    assert(calls == 2 && shutdown_on);
++    /* KEY3 held through a PWR press: PWR still decides. */
++    s_key.next = MUSE_BTN_TALK_PRESS;
++    assert(poll_pmu(0) == MUSE_BTN_TALK_PRESS);
++    assert(poll_pmu(MUSE_PMU_KEY_PRESS) == 0 && calls == 3 && !shutdown_on);
++    assert(poll_pmu(MUSE_PMU_KEY_RELEASE) == 0 && calls == 4 && shutdown_on);
++    s_key.next = MUSE_BTN_TALK_RELEASE;
++    assert(poll_pmu(0) == MUSE_BTN_TALK_RELEASE && calls == 4);
++    /* BOOT is aux. */
++    s_boot.next = MUSE_BTN_TALK_PRESS;
++    assert(poll_pmu(0) == MUSE_BTN_AUX_PRESS && calls == 4);
++    return 0;
++}
++''')
+-- 
+2.43.0
+
