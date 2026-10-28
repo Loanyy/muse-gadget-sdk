@@ -51,6 +51,8 @@ static esp_err_t init(void)
         return ESP_OK;
     }
     s_pmu = true;
+    /* PWR talks: its hold-off on, whatever a reset in a held talk left. */
+    (void)muse_pmu_set_key_shutdown(true);   /* logs if it can't */
     return ESP_OK;
 }
 

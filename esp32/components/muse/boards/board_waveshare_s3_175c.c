@@ -78,6 +78,10 @@ static esp_err_t init(void)
         ESP_LOGW(TAG, "PMU unavailable (%s): battery status disabled", esp_err_to_name(err));
         return ESP_OK;
     }
+#if !CONFIG_MUSE_BOARD_WAVESHARE_S3_175
+    /* PWR talks: its hold-off on, whatever a reset in a held talk left. */
+    (void)muse_pmu_set_key_shutdown(true);   /* logs if it can't */
+#endif
     /* Only DCDC1 (VCC3V3) and ALDO1 (A3V3, for the codecs) feed anything; the
      * schematic leaves the rest unconnected. Waveshare's AXP2101 example and
      * xiaozhi's board turn them off too. */

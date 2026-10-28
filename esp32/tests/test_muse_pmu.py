@@ -67,7 +67,7 @@ class MusePmu(unittest.TestCase):
         result = subprocess.run([str(self.binary), str(case)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_init_sets_10s_hold_off_and_turns_key_shutdown_on(self):
+    def test_init_sets_10s_hold_off_and_leaves_key_shutdowns(self):
         self.run_case(0)
 
     def test_key_shutdown_changes_only_its_bit(self):
@@ -78,6 +78,41 @@ class MusePmu(unittest.TestCase):
 
     def test_no_pmu_is_invalid_state_and_quiet(self):
         self.run_case(3)
+
+    def test_16s_shutdown_is_off_only_while_held(self):
+        self.run_case(4)
+
+    def test_16s_shutdown_errors(self):
+        self.run_case(5)
+
+
+class PowerKeyTalkBoardsInit(unittest.TestCase):
+    """The boards that talk on PWR turn its shutdowns on at boot (a reset in a
+    held talk may have left them off); the others leave the PMU's alone."""
+
+    def init_of(self, name):
+        source = (MUSE / "boards" / name).read_text()
+        start = source.index("static esp_err_t init(void)\n{")
+        depth, end = 1, source.index("{", start) + 1
+        while depth:
+            depth += (source[end] == "{") - (source[end] == "}")
+            end += 1
+        return source[start:end]
+
+    def test_pwr_talk_boards_turn_key_shutdown_on(self):
+        for name in ("board_m5stack_cores3.c", "board_waveshare_s3_216.c"):
+            init = self.init_of(name)
+            self.assertIn("muse_pmu_set_key_shutdown(true)", init, name)
+            self.assertLess(init.index("muse_pmu_init("), init.index("muse_pmu_set_key_shutdown(true)"), name)
+        init = self.init_of("board_waveshare_s3_175c.c")
+        # The 1.75 shares the file and talks on BOOT: only the 1.75C's branch.
+        call = init.index("muse_pmu_set_key_shutdown(true)")
+        self.assertIn("#if !CONFIG_MUSE_BOARD_WAVESHARE_S3_175", init[:call])
+        self.assertNotIn("#endif", init[init.rindex("#if !CONFIG_MUSE_BOARD_WAVESHARE_S3_175", 0, call):call])
+
+    def test_other_axp2101_boards_leave_it(self):
+        for name in ("board_waveshare_c6_18.c", "board_waveshare_c6_206.c"):
+            self.assertNotIn("muse_pmu_set_key_shutdown", (MUSE / "boards" / name).read_text(), name)
 
 
 # Fakes for the boards' poll_buttons(): GPIO buttons and the PMU's latched key
