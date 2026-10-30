@@ -327,7 +327,7 @@ left from Muse). RST on the bottom edge restarts the board, and holding it for
 click PWR to turn it back on. While Muse is running, holding PWR is a talk and
 never powers the board off: Muse turns off the AXP2101's power-off hold for as
 long as PWR is down. If the firmware has stopped, holding PWR for 10 s still
-cuts the power; RST always restarts it.
+cuts the power, unless it stopped during a PWR talk; RST always restarts it.
 Its 1 W speaker is quiet, so the volume starts at 100%. The camera, proximity
 sensor, IMU, RTC, SD card and Grove ports aren't used yet. It enumerates as the
 chip's own USB serial port: `tools/muse/board.sh flash cores3`. If esptool

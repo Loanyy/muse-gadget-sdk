@@ -245,7 +245,7 @@ static unsigned poll_buttons(void)
         (void)muse_pmu_set_key_shutdown(false);   /* logs if it can't */
     }
     if (pwr & MUSE_BTN_TALK_RELEASE) {
-        (void)muse_pmu_set_key_shutdown(true);
+        (void)muse_pmu_set_key_shutdown(true);    /* logs if it can't */
     }
     return pwr | muse_gpio_button_poll(&s_boot) << 2;   /* BOOT is aux */
 }
