@@ -61,8 +61,10 @@ icon under BOOT.
 
 - **KEY3 (GPIO18, active low):** push-to-talk, pairing confirmation and wake.
 - **PWR:** wired only to the AXP2101. The port latches its key edges over I2C
-  and treats them as talk too. The PMU powers the board off after a 10 s hold.
-  Because its IRQ isn't wired to the ESP32, PWR can't wake the chip from light
+  and treats them as talk too. While the firmware runs, holding PWR never
+  powers the board off: the port turns off the PMU's power-off hold while PWR
+  is down, so a talk can run its full length. If the firmware has stopped, a
+  10 s hold still cuts the power; otherwise hold BOOT to power off. Because its IRQ isn't wired to the ESP32, PWR can't wake the chip from light
   sleep: a quick press while the screen is off is ignored, so use KEY3 to wake
   it. Holding KEY3 and PWR together keeps one turn going until both are
   released.

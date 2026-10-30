@@ -51,7 +51,8 @@ static esp_err_t init(void)
         return ESP_OK;
     }
     s_pmu = true;
-    /* PWR talks: its hold-off on, whatever a reset in a held talk left. */
+    /* PWR talks: the 10 s hold-off back on, whatever a reset in a held talk
+     * left (a 16 s shutdown cleared then stays off, the datasheet default). */
     (void)muse_pmu_set_key_shutdown(true);   /* logs if it can't */
     return ESP_OK;
 }
@@ -129,7 +130,7 @@ static unsigned poll_buttons(void)
     /* A talk can outlast the PMU's hold-off: held, PWR mustn't power off.
      * Both edges in one read leave PWR as it was (talk_button's order). */
     if (press != release) {
-        muse_pmu_set_key_shutdown(release);
+        (void)muse_pmu_set_key_shutdown(release);   /* logs if it can't */
     }
     return (press ? MUSE_BTN_TALK_PRESS : 0) | (release ? MUSE_BTN_TALK_RELEASE : 0);
 }

@@ -79,7 +79,8 @@ static esp_err_t init(void)
         return ESP_OK;
     }
 #if !CONFIG_MUSE_BOARD_WAVESHARE_S3_175
-    /* PWR talks: its hold-off on, whatever a reset in a held talk left. */
+    /* PWR talks: the 10 s hold-off back on, whatever a reset in a held talk
+     * left (a 16 s shutdown cleared then stays off, the datasheet default). */
     (void)muse_pmu_set_key_shutdown(true);   /* logs if it can't */
 #endif
     /* Only DCDC1 (VCC3V3) and ALDO1 (A3V3, for the codecs) feed anything; the
@@ -241,10 +242,10 @@ static unsigned poll_buttons(void)
     unsigned pwr = muse_gpio_button_poll(&s_pwr);
     /* A talk can outlast the PMU's hold-off: held, PWR mustn't power off. */
     if (pwr & MUSE_BTN_TALK_PRESS) {
-        muse_pmu_set_key_shutdown(false);
+        (void)muse_pmu_set_key_shutdown(false);   /* logs if it can't */
     }
     if (pwr & MUSE_BTN_TALK_RELEASE) {
-        muse_pmu_set_key_shutdown(true);
+        (void)muse_pmu_set_key_shutdown(true);
     }
     return pwr | muse_gpio_button_poll(&s_boot) << 2;   /* BOOT is aux */
 }
