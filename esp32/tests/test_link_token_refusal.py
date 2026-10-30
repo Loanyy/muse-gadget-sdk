@@ -97,7 +97,9 @@ class LinkTokenRefusalTest(unittest.TestCase):
                 with self.subTest(profile=name):
                     binary = generated / name
                     compiled = subprocess.run(
-                        [*cc, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                        # config_store.c's TAG and the eFuse fake are only used by
+                        # logging and NVS encryption, which link_fakes compile out.
+                        [*cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-variable",
                          f"-DREOPEN_IN_PLACE={in_place}",
                          f"-DWIFI_WITHOUT_PAIRING={unpaired_wifi}",
                          "-I", str(generated),

@@ -116,7 +116,15 @@ typedef uint32_t TickType_t;
 #define pdPASS 1
 #define portMAX_DELAY 0xffffffffu
 #define pdMS_TO_TICKS(ms) (ms)
-#define xSemaphoreTake(s, t) ((void)(s), (void)(t), pdTRUE)
+/* A function, not a comma expression: app.c ignores the result as it may
+ * with FreeRTOS's, and gcc -Werror would call a bare pdTRUE no effect. */
+static int fake_semaphore_take(SemaphoreHandle_t s, TickType_t t)
+{
+    (void)s;
+    (void)t;
+    return pdTRUE;
+}
+#define xSemaphoreTake(s, t) fake_semaphore_take((s), (t))
 #define xSemaphoreGive(s) ((void)(s))
 #define xTaskCreate(fn, name, stack, arg, prio, handle) \
     ((void)(fn), (void)(name), (void)(arg), (void)(handle), pdPASS)
